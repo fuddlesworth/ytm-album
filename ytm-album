@@ -541,19 +541,32 @@ def find_artist_discography(
                     seen.add(bid)
                     releases.append({"browseId": bid})
 
-    # Hydrate any release missing year/proper title via get_album().
-    # Only needed for ones we got via scrape (no metadata).
+    # Hydrate any release missing year/proper title via get_album(),
+    # then filter to only releases where our target artist is credited.
+    target_id_norm = channel_id  # canonical artist channel ID
+    target_name_norm = _normalize(canonical_name)
+
+    def is_target_artist(meta: dict) -> bool:
+        for a in meta.get("artists", []) or []:
+            if a.get("id") == target_id_norm:
+                return True
+            if _normalize(a.get("name", "")) == target_name_norm:
+                return True
+        return False
+
     for r in releases:
-        if not r.get("year"):
-            try:
-                meta = yt.get_album(r["browseId"])
-                r["title"] = meta.get("title", r.get("title", "Unknown"))
-                r["year"] = meta.get("year")
-                r["type"] = meta.get("type", r.get("type", "Album"))
-                if not r.get("artists"):
-                    r["artists"] = meta.get("artists", [])
-            except Exception:
-                pass
+        # Always hydrate so we have artists + type for filtering.
+        try:
+            meta = yt.get_album(r["browseId"])
+        except Exception:
+            continue
+        r["title"] = meta.get("title", r.get("title", "Unknown"))
+        r["year"] = meta.get("year") or r.get("year")
+        r["type"] = meta.get("type", r.get("type", "Album"))
+        r["artists"] = meta.get("artists", []) or r.get("artists", [])
+        if is_target_artist(meta):
+            filtered.append(r)
+    releases = filtered
 
     # Filter by requested types — get_album() reveals the true type
     # ("Album" / "EP" / "Single") which scraped entries didn't have.
