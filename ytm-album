@@ -304,16 +304,18 @@ def _search_releases_by_artist(
     return found
 
 
-def _ytdlp_releases(channel_id: str, browser: str) -> list[dict]:
-    """Enumerate the artist's `/releases` tab on YouTube using yt-dlp.
+def _ytdlp_channel_albums(channel_id: str, browser: str) -> list[str]:
+    """Enumerate every track on the artist's YouTube channel and extract the
+    unique set of album playlist IDs they belong to.
 
-    Returns a list of {browseId/playlistId, title} for every release listed.
-    Each entry on /releases is a playlist URL (`OLAK5uy_...`) which corresponds
-    one-to-one with an album on YouTube Music. We don't get the MPREb_ browseId
-    here, but ytmusicapi's get_album accepts playlistId via lookup too.
+    The /releases tab is missing for some artists, but the bare channel URL
+    enumerates every video. Each YouTube Music track has a `playlist_id`
+    metadata field pointing to its OLAK5uy_... album playlist. Deduping
+    those playlist IDs gives us the full album list, even when ytmusicapi's
+    artist page is malformed.
     """
     import json
-    url = f"https://www.youtube.com/channel/{channel_id}/releases"
+    url = f"https://www.youtube.com/channel/{channel_id}"
     cmd = [
         "yt-dlp",
         "--flat-playlist",
@@ -324,22 +326,32 @@ def _ytdlp_releases(channel_id: str, browser: str) -> list[dict]:
         url,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if result.returncode != 0 or not result.stdout.strip():
             return []
         data = json.loads(result.stdout)
     except Exception:
         return []
 
-    found: list[dict] = []
-    for entry in data.get("entries") or []:
-        title = entry.get("title")
-        # Releases tab returns playlist entries; the URL is the OLAK5uy_ playlist
-        playlist_id = entry.get("id") or ""
-        if not playlist_id:
-            continue
-        found.append({"playlistId": playlist_id, "title": title or "Unknown"})
-    return found
+    playlist_ids: list[str] = []
+    seen: set[str] = set()
+
+    def walk(entries):
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            # Channels have nested entries (one per tab/playlist)
+            if entry.get("entries"):
+                walk(entry["entries"])
+                continue
+            # Each video entry's playlist_id is the album it belongs to
+            pid = entry.get("playlist_id") or entry.get("playlist") or ""
+            if pid and pid.startswith("OLAK5uy_") and pid not in seen:
+                seen.add(pid)
+                playlist_ids.append(pid)
+
+    walk(data.get("entries"))
+    return playlist_ids
 
 
 def _playlist_to_browse_id(yt: YTMusic, playlist_id: str) -> str | None:
@@ -458,20 +470,15 @@ def find_artist_discography(
     for kind in sections:
         add(_search_releases_by_artist(yt, canonical_name, channel_id, kind))
 
-    # Last resort: scrape the artist's YouTube /releases tab via yt-dlp.
-    # This hits a completely different backend and finds releases the
-    # ytmusicapi paths miss (especially for artists with malformed pages).
-    ytdlp_releases = _ytdlp_releases(channel_id, browser)
-    for entry in ytdlp_releases:
-        playlist_id = entry["playlistId"]
+    # Last resort: enumerate every track on the artist's YouTube channel via
+    # yt-dlp and dedupe by album playlist ID. Catches releases that
+    # ytmusicapi's artist page misses (e.g. m.o.v.e.).
+    for playlist_id in _ytdlp_channel_albums(channel_id, browser):
         browse_id = _playlist_to_browse_id(yt, playlist_id)
         if not browse_id or browse_id in seen:
             continue
         seen.add(browse_id)
-        releases.append({
-            "browseId": browse_id,
-            "title": entry["title"],
-        })
+        releases.append({"browseId": browse_id})
 
     # Hydrate any release missing year/proper title via get_album().
     # Only needed for ones we got via scrape (no metadata).
