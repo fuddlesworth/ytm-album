@@ -304,6 +304,52 @@ def _search_releases_by_artist(
     return found
 
 
+def _ytdlp_releases(channel_id: str, browser: str) -> list[dict]:
+    """Enumerate the artist's `/releases` tab on YouTube using yt-dlp.
+
+    Returns a list of {browseId/playlistId, title} for every release listed.
+    Each entry on /releases is a playlist URL (`OLAK5uy_...`) which corresponds
+    one-to-one with an album on YouTube Music. We don't get the MPREb_ browseId
+    here, but ytmusicapi's get_album accepts playlistId via lookup too.
+    """
+    import json
+    url = f"https://www.youtube.com/channel/{channel_id}/releases"
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--dump-single-json",
+        "--cookies-from-browser", browser,
+        "--quiet",
+        "--no-warnings",
+        url,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+    except Exception:
+        return []
+
+    found: list[dict] = []
+    for entry in data.get("entries") or []:
+        title = entry.get("title")
+        # Releases tab returns playlist entries; the URL is the OLAK5uy_ playlist
+        playlist_id = entry.get("id") or ""
+        if not playlist_id:
+            continue
+        found.append({"playlistId": playlist_id, "title": title or "Unknown"})
+    return found
+
+
+def _playlist_to_browse_id(yt: YTMusic, playlist_id: str) -> str | None:
+    """Resolve an OLAK5uy_... playlist ID to its MPREb_ album browseId."""
+    try:
+        return yt.get_album_browse_id(playlist_id)
+    except Exception:
+        return None
+
+
 def _scrape_albums_via_browse(
     yt: YTMusic, channel_id: str, params: str | None = None
 ) -> list[dict]:
@@ -349,7 +395,8 @@ def _scrape_albums_via_browse(
 
 
 def find_artist_discography(
-    yt: YTMusic, artist: str, *, include_albums: bool, include_singles: bool
+    yt: YTMusic, artist: str, *, include_albums: bool, include_singles: bool,
+    browser: str = "firefox"
 ) -> tuple[str, list[dict]]:
     """Return (canonical_artist_name, [release_dict, ...]) for an artist.
 
@@ -410,6 +457,21 @@ def find_artist_discography(
     # Search supplement — catches anything not linked from the artist page.
     for kind in sections:
         add(_search_releases_by_artist(yt, canonical_name, channel_id, kind))
+
+    # Last resort: scrape the artist's YouTube /releases tab via yt-dlp.
+    # This hits a completely different backend and finds releases the
+    # ytmusicapi paths miss (especially for artists with malformed pages).
+    ytdlp_releases = _ytdlp_releases(channel_id, browser)
+    for entry in ytdlp_releases:
+        playlist_id = entry["playlistId"]
+        browse_id = _playlist_to_browse_id(yt, playlist_id)
+        if not browse_id or browse_id in seen:
+            continue
+        seen.add(browse_id)
+        releases.append({
+            "browseId": browse_id,
+            "title": entry["title"],
+        })
 
     # Hydrate any release missing year/proper title via get_album().
     # Only needed for ones we got via scrape (no metadata).
@@ -545,6 +607,7 @@ def main() -> int:
         args.artist,
         include_albums=args.include_albums,
         include_singles=args.include_singles,
+        browser=args.browser,
     )
     if not albums:
         kinds = " + ".join(
