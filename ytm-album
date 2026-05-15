@@ -304,15 +304,13 @@ def _search_releases_by_artist(
     return found
 
 
-def _ytdlp_channel_albums(channel_id: str, browser: str) -> list[str]:
-    """Enumerate every track on the artist's YouTube channel and extract the
-    unique set of album playlist IDs they belong to.
+def _ytdlp_channel_video_ids(channel_id: str, browser: str) -> list[str]:
+    """Enumerate every videoId on the artist's YouTube channel via yt-dlp.
 
-    The /releases tab is missing for some artists, but the bare channel URL
-    enumerates every video. Each YouTube Music track has a `playlist_id`
-    metadata field pointing to its OLAK5uy_... album playlist. Deduping
-    those playlist IDs gives us the full album list, even when ytmusicapi's
-    artist page is malformed.
+    Returns just the video IDs — the `--flat-playlist` output's `playlist_id`
+    field is the channel's uploads playlist (UU...), not the per-video album
+    playlist, so we can't get album IDs directly. We resolve each videoId
+    to its album in a separate step via ytmusicapi.get_song().
     """
     import json
     url = f"https://www.youtube.com/channel/{channel_id}"
@@ -333,25 +331,51 @@ def _ytdlp_channel_albums(channel_id: str, browser: str) -> list[str]:
     except Exception:
         return []
 
-    playlist_ids: list[str] = []
+    video_ids: list[str] = []
     seen: set[str] = set()
 
     def walk(entries):
         for entry in entries or []:
             if not isinstance(entry, dict):
                 continue
-            # Channels have nested entries (one per tab/playlist)
             if entry.get("entries"):
                 walk(entry["entries"])
                 continue
-            # Each video entry's playlist_id is the album it belongs to
-            pid = entry.get("playlist_id") or entry.get("playlist") or ""
-            if pid and pid.startswith("OLAK5uy_") and pid not in seen:
-                seen.add(pid)
-                playlist_ids.append(pid)
+            vid = entry.get("id") or ""
+            if vid and len(vid) == 11 and vid not in seen:
+                seen.add(vid)
+                video_ids.append(vid)
 
     walk(data.get("entries"))
-    return playlist_ids
+    return video_ids
+
+
+def _video_to_album_browse_id(yt: YTMusic, video_id: str) -> str | None:
+    """Resolve a videoId to its album's MPREb_ browseId via get_song.
+
+    Each YouTube Music track's metadata includes the album it belongs to.
+    Returns None for videos that aren't part of an album (live, demos, etc.).
+    """
+    try:
+        song = yt.get_song(video_id)
+    except Exception:
+        return None
+    # The album info is under videoDetails or microformat; try both.
+    # ytmusicapi normalizes it to a top-level "album" key when present.
+    album = song.get("videoDetails", {}).get("musicVideoType")
+    # Actual album browse id lives in the "album" field of get_song output;
+    # ytmusicapi 1.x exposes this only for full song metadata via a different
+    # endpoint. Use get_watch_playlist instead — it gives us album.id reliably.
+    try:
+        wp = yt.get_watch_playlist(videoId=video_id, limit=1)
+        track = (wp.get("tracks") or [{}])[0]
+        album_info = track.get("album") or {}
+        bid = album_info.get("id")
+        if bid and bid.startswith("MPREb_"):
+            return bid
+    except Exception:
+        pass
+    return None
 
 
 def _playlist_to_browse_id(yt: YTMusic, playlist_id: str) -> str | None:
@@ -470,15 +494,25 @@ def find_artist_discography(
     for kind in sections:
         add(_search_releases_by_artist(yt, canonical_name, channel_id, kind))
 
-    # Last resort: enumerate every track on the artist's YouTube channel via
-    # yt-dlp and dedupe by album playlist ID. Catches releases that
-    # ytmusicapi's artist page misses (e.g. m.o.v.e.).
-    for playlist_id in _ytdlp_channel_albums(channel_id, browser):
-        browse_id = _playlist_to_browse_id(yt, playlist_id)
-        if not browse_id or browse_id in seen:
-            continue
-        seen.add(browse_id)
-        releases.append({"browseId": browse_id})
+    # Last resort: walk every track on the artist's YouTube channel and
+    # resolve each videoId to its album browseId via ytmusicapi. This catches
+    # everything the artist page / search misses.
+    video_ids = _ytdlp_channel_video_ids(channel_id, browser)
+    if video_ids:
+        console.print(
+            f"  [dim]Resolving {len(video_ids)} tracks to albums "
+            f"(this may take a moment)...[/]"
+        )
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {
+                pool.submit(_video_to_album_browse_id, yt, vid): vid
+                for vid in video_ids
+            }
+            for fut in as_completed(futures):
+                bid = fut.result()
+                if bid and bid not in seen:
+                    seen.add(bid)
+                    releases.append({"browseId": bid})
 
     # Hydrate any release missing year/proper title via get_album().
     # Only needed for ones we got via scrape (no metadata).
