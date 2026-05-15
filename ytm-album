@@ -98,6 +98,29 @@ def write_tags(
     audio.save()
 
 
+def _find_track_videoid(
+    yt: YTMusic, title: str, artist: str, album: str
+) -> str | None:
+    """Fallback: search YouTube Music for a track when get_album omits its videoId."""
+    queries = [
+        f"{artist} {title} {album}",
+        f"{artist} {title}",
+        f"{title} {album}",
+    ]
+    target_title = "".join(c for c in title.lower() if c.isalnum())
+    for q in queries:
+        try:
+            results = yt.search(q, filter="songs", limit=10)
+        except Exception:
+            continue
+        for r in results:
+            if r.get("videoId") and "".join(
+                c for c in r.get("title", "").lower() if c.isalnum()
+            ) == target_title:
+                return r["videoId"]
+    return None
+
+
 def process_track(
     *,
     index: int,
@@ -110,6 +133,7 @@ def process_track(
     year: str | None,
     cover_bytes: bytes | None,
     skip_existing: bool,
+    yt: YTMusic,
 ) -> tuple[str, str, float]:
     """Download + tag one track. Returns (status, message, elapsed_seconds)."""
     track_title = track["title"]
@@ -117,7 +141,9 @@ def process_track(
     video_id = track.get("videoId")
 
     if not video_id:
-        return ("skip", f"{index:02d}. {track_title} (no videoId)", 0.0)
+        video_id = _find_track_videoid(yt, track_title, track_artists, album_title)
+        if not video_id:
+            return ("skip", f"{index:02d}. {track_title} (unavailable in region)", 0.0)
 
     dest = album_dir / f"{index:02d} - {sanitize(track_title)}.m4a"
 
@@ -229,6 +255,7 @@ def download_album(
                     year=year,
                     cover_bytes=cover_bytes,
                     skip_existing=skip_existing,
+                    yt=yt,
                 )
                 for i, track in enumerate(tracks, start=1)
             ]
@@ -540,13 +567,10 @@ def find_artist_discography(
         if r.get("type", "Album") in allowed_types
     ]
 
-    # Sort: oldest first, then alphabetically as tiebreaker.
-    # Releases with no year sort last (treated as year 9999).
+    # Sort: newest first, then alphabetically as tiebreaker
     releases.sort(
-        key=lambda r: (
-            int(r["year"]) if str(r.get("year", "")).isdigit() else 9999,
-            r.get("title", ""),
-        ),
+        key=lambda r: (-(int(r["year"]) if str(r.get("year", "")).isdigit() else 0),
+                       r.get("title", "")),
     )
     return canonical_name, releases
 
