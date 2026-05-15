@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""Download a YouTube Music album (or full artist discography).
+
+Uses ytmusicapi for canonical metadata, yt-dlp for audio bytes,
+and mutagen to write tags + embed cover art. Tracks download in parallel.
+
+Usage:
+  ytm-album "Artist" "Album"          # single album
+  ytm-album "Artist"                  # every album for the artist
+"""
+import argparse
+import subprocess
+import sys
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+from ytmusicapi import YTMusic
+from mutagen.mp4 import MP4, MP4Cover
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
+from rich.text import Text
+
+
+console = Console()
+
+
+def sanitize(name: str) -> str:
+    """Strip filesystem-hostile characters from a folder name."""
+    bad = '/\\:*?"<>|'
+    return "".join("_" if c in bad else c for c in name).strip().rstrip(".")
+
+
+def fetch_cover_bytes(thumbnails: list) -> bytes | None:
+    """Fetch the highest-resolution album cover from YouTube Music."""
+    if not thumbnails:
+        return None
+    url = thumbnails[-1]["url"]
+    if "=w" in url:
+        url = url.split("=w")[0] + "=w1200-h1200-l90-rj"
+    with urllib.request.urlopen(url) as r:
+        return r.read()
+
+
+def download_track(video_id: str, dest: Path, browser: str) -> tuple[int, str]:
+    """Download a single track's m4a audio. Returns (rc, captured_output)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "yt-dlp",
+        "--quiet",
+        "--no-warnings",
+        "--no-part",
+        "--cookies-from-browser", browser,
+        "-f", "bestaudio[ext=m4a]",
+        "-o", str(dest),
+        f"https://music.youtube.com/watch?v={video_id}",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = (result.stdout + result.stderr).strip()
+    return result.returncode, output
+
+
+def write_tags(
+    path: Path,
+    *,
+    title: str,
+    artist: str,
+    album_artist: str,
+    album: str,
+    track_num: int,
+    track_total: int,
+    year: str | None,
+    cover: bytes | None,
+) -> None:
+    """Write iTunes-style MP4 tags + embed cover art."""
+    audio = MP4(path)
+    audio["\xa9nam"] = title
+    audio["\xa9ART"] = artist
+    audio["aART"] = album_artist
+    audio["\xa9alb"] = album
+    audio["trkn"] = [(track_num, track_total)]
+    if year:
+        audio["\xa9day"] = str(year)
+    if cover:
+        audio["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_JPEG)]
+    audio.save()
+
+
+def process_track(
+    *,
+    index: int,
+    total: int,
+    track: dict,
+    album_dir: Path,
+    browser: str,
+    album_artist: str,
+    album_title: str,
+    year: str | None,
+    cover_bytes: bytes | None,
+    skip_existing: bool,
+) -> tuple[str, str, float]:
+    """Download + tag one track. Returns (status, message, elapsed_seconds)."""
+    track_title = track["title"]
+    track_artists = ", ".join(a["name"] for a in track.get("artists", [])) or album_artist
+    video_id = track.get("videoId")
+
+    if not video_id:
+        return ("skip", f"{index:02d}. {track_title} (no videoId)", 0.0)
+
+    dest = album_dir / f"{index:02d} - {sanitize(track_title)}.m4a"
+
+    if skip_existing and dest.exists() and dest.stat().st_size > 0:
+        return ("skip", f"{index:02d}. {track_title} (already downloaded)", 0.0)
+
+    start = time.monotonic()
+    rc, output = download_track(video_id, dest, browser)
+    elapsed = time.monotonic() - start
+
+    if rc != 0 or not dest.exists():
+        last_line = output.splitlines()[-1] if output else "unknown error"
+        return ("fail", f"{index:02d}. {track_title} — {last_line}", elapsed)
+
+    write_tags(
+        dest,
+        title=track_title,
+        artist=track_artists,
+        album_artist=album_artist,
+        album=album_title,
+        track_num=index,
+        track_total=total,
+        year=year,
+        cover=cover_bytes,
+    )
+    return ("done", f"{index:02d}. {track_title}", elapsed)
+
+
+def status_text(status: str, message: str, elapsed: float) -> Text:
+    """Format a per-track status line with color."""
+    if status == "done":
+        return Text.assemble(
+            ("✓ ", "bold green"),
+            (message, "white"),
+            (f"  ({elapsed:.1f}s)", "dim"),
+        )
+    if status == "fail":
+        return Text.assemble(("✗ ", "bold red"), (message, "red"))
+    return Text.assemble(("· ", "yellow"), (message, "dim"))
+
+
+def download_album(
+    yt: YTMusic,
+    *,
+    browse_id: str,
+    album_artist_override: str,
+    output_dir: Path,
+    browser: str,
+    jobs: int,
+    skip_existing: bool,
+) -> bool:
+    """Download a single album by browseId. Returns True on full success."""
+    album_data = yt.get_album(browse_id)
+    tracks = album_data.get("tracks", [])
+    if not tracks:
+        console.print("  [yellow]Album has no tracks[/]")
+        return False
+
+    album_title = album_data["title"]
+    year = album_data.get("year")
+    album_artist = album_artist_override or (
+        album_data.get("artists", [{}])[0].get("name", "Unknown")
+    )
+
+    album_dir = output_dir / sanitize(album_artist) / sanitize(album_title)
+    album_dir.mkdir(parents=True, exist_ok=True)
+
+    header = Text.assemble(
+        (f"{album_artist}", "bold cyan"),
+        (" — ", "dim"),
+        (f"{album_title}", "bold white"),
+        (f"  ({year or '?'})", "dim"),
+    )
+    console.print(Panel(header, expand=False, border_style="cyan"))
+    console.print(f"  [dim]→[/] {album_dir}")
+
+    cover_bytes = fetch_cover_bytes(album_data.get("thumbnails", []))
+    cover_path = album_dir / "cover.jpg"
+    if cover_bytes and not cover_path.exists():
+        cover_path.write_bytes(cover_bytes)
+
+    total = len(tracks)
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    )
+    task_id = progress.add_task(f"[cyan]Tracks", total=total)
+
+    results: list[Text] = []
+    successes = 0
+
+    with Live(Group(progress), console=console, refresh_per_second=10):
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [
+                pool.submit(
+                    process_track,
+                    index=i,
+                    total=total,
+                    track=track,
+                    album_dir=album_dir,
+                    browser=browser,
+                    album_artist=album_artist,
+                    album_title=album_title,
+                    year=year,
+                    cover_bytes=cover_bytes,
+                    skip_existing=skip_existing,
+                )
+                for i, track in enumerate(tracks, start=1)
+            ]
+            for fut in as_completed(futures):
+                status, message, elapsed = fut.result()
+                results.append(status_text(status, message, elapsed))
+                progress.update(task_id, advance=1)
+                if status in ("done", "skip"):
+                    successes += 1
+
+    # Print results sorted by track number for stable ordering
+    results.sort(key=lambda t: t.plain[2:].lstrip())
+    for line in results:
+        console.print("  ", line)
+
+    return successes == total
+
+
+def find_album(yt: YTMusic, artist: str, album: str) -> dict | None:
+    """Search YouTube Music for an album. Returns the top match or None."""
+    results = yt.search(f"{artist} {album}", filter="albums", limit=5)
+    return results[0] if results else None
+
+
+def _expand_section(yt: YTMusic, channel_id: str, section: dict) -> tuple[list[dict], bool]:
+    """Return (releases, fully_expanded) for an artist section.
+
+    fully_expanded=False means we likely have a truncated list (~10 items)
+    and a search fallback should be used to find more.
+    """
+    inline = list(section.get("results", []))
+    params = section.get("params")
+    if params:
+        try:
+            full = yt.get_artist_albums(channel_id, params)
+            if full:
+                return full, True
+        except Exception:
+            # Known ytmusicapi quirk on certain artist layouts.
+            pass
+        return inline, False  # had params but couldn't expand → likely truncated
+    return inline, True  # no params → inline is the full list
+
+
+def _normalize(s: str) -> str:
+    """Lowercase, strip whitespace, drop punctuation for fuzzy artist matching."""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def _search_releases_by_artist(
+    yt: YTMusic, artist_name: str, channel_id: str, kind: str, limit: int = 200
+) -> list[dict]:
+    """Find releases of a given kind ('albums' or 'singles') for an artist via search.
+
+    Matches on channel ID first (bulletproof), then falls back to fuzzy name match.
+    """
+    found = []
+    try:
+        results = yt.search(artist_name, filter=kind, limit=limit)
+    except Exception:
+        return []
+    target = _normalize(artist_name)
+    for r in results:
+        artists = r.get("artists") or []
+        # Primary: match by channel ID (the artist's canonical YT Music ID).
+        if any(a.get("id") == channel_id for a in artists):
+            found.append(r)
+            continue
+        # Fallback: fuzzy name match for artists where search results lack IDs.
+        names = [_normalize(a.get("name", "")) for a in artists]
+        if any(n and (n == target or target in n or n in target) for n in names):
+            found.append(r)
+    return found
+
+
+def _scrape_albums_via_browse(
+    yt: YTMusic, channel_id: str, params: str | None = None
+) -> list[dict]:
+    """Fall back to scraping the artist's all-albums page directly.
+
+    When get_artist_albums() fails with the musicCarouselShelfRenderer error,
+    we hit the underlying browse endpoint and pull every release we can find.
+    Pass `params` (from artist_data['albums']['params']) to fetch the dedicated
+    all-albums page; without it, you only get the artist landing page (truncated).
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+    body: dict = {"browseId": channel_id}
+    if params:
+        body["params"] = params
+    try:
+        response = yt._send_request("browse", body)
+    except Exception:
+        return []
+
+    def walk(node):
+        if isinstance(node, dict):
+            be = node.get("browseEndpoint")
+            if be and be.get("browseId", "").startswith("MPREb_"):
+                bid = be["browseId"]
+                if bid not in seen:
+                    seen.add(bid)
+                    # Title text often sits one level up; try common locations
+                    title = None
+                    text = node.get("text") if isinstance(node.get("text"), dict) else None
+                    if text and "runs" in text:
+                        title = text["runs"][0].get("text")
+                    found.append({"browseId": bid, "title": title or "Unknown"})
+                return
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(response)
+    return found
+
+
+def find_artist_discography(
+    yt: YTMusic, artist: str, *, include_albums: bool, include_singles: bool
+) -> tuple[str, list[dict]]:
+    """Return (canonical_artist_name, [release_dict, ...]) for an artist.
+
+    Tries the artist page first (cleanest metadata); if any section comes back
+    truncated, supplements with search results filtered to the artist.
+    Sections are selected via include_albums / include_singles.
+    """
+    results = yt.search(artist, filter="artists", limit=1)
+    if not results:
+        return artist, []
+    channel_id = results[0]["browseId"]
+    canonical_name = results[0]["artist"]
+
+    sections: list[str] = []
+    if include_albums:
+        sections.append("albums")
+    if include_singles:
+        sections.append("singles")
+    if not sections:
+        return canonical_name, []
+
+    artist_data = yt.get_artist(channel_id)
+    releases: list[dict] = []
+    seen: set[str] = set()
+
+    def add(items: list[dict]) -> None:
+        for r in items:
+            bid = r.get("browseId")
+            if bid and bid not in seen:
+                seen.add(bid)
+                releases.append(r)
+
+    # Collect each section's params for the dedicated all-releases pages.
+    section_params: dict[str, str] = {}
+    for key in sections:
+        section = artist_data.get(key)
+        if not section:
+            continue
+        items, _ = _expand_section(yt, channel_id, section)
+        add(items)
+        if section.get("params"):
+            section_params[key] = section["params"]
+
+    # Scrape the dedicated all-albums / all-singles pages directly.
+    # Bypasses ytmusicapi's broken get_artist_albums() parser.
+    for key, params in section_params.items():
+        scraped = _scrape_albums_via_browse(yt, channel_id, params=params)
+        for r in scraped:
+            if r["browseId"] in seen:
+                continue
+            seen.add(r["browseId"])
+            releases.append({
+                "browseId": r["browseId"],
+                "title": r["title"],
+                "type": "Album" if key == "albums" else "Single",
+            })
+
+    # Search supplement — catches anything not linked from the artist page.
+    for kind in sections:
+        add(_search_releases_by_artist(yt, canonical_name, channel_id, kind))
+
+    # Hydrate any release missing year/proper title via get_album().
+    # Only needed for ones we got via scrape (no metadata).
+    for r in releases:
+        if not r.get("year"):
+            try:
+                meta = yt.get_album(r["browseId"])
+                r["title"] = meta.get("title", r.get("title", "Unknown"))
+                r["year"] = meta.get("year")
+                r["type"] = meta.get("type", r.get("type", "Album"))
+                if not r.get("artists"):
+                    r["artists"] = meta.get("artists", [])
+            except Exception:
+                pass
+
+    # Filter by requested types — get_album() reveals the true type
+    # ("Album" / "EP" / "Single") which scraped entries didn't have.
+    allowed_types: set[str] = set()
+    if include_albums:
+        allowed_types.add("Album")
+    if include_singles:
+        allowed_types.update({"EP", "Single"})
+    releases = [
+        r for r in releases
+        if r.get("type", "Album") in allowed_types
+    ]
+
+    # Sort: newest first, then alphabetically as tiebreaker
+    releases.sort(
+        key=lambda r: (-(int(r["year"]) if str(r.get("year", "")).isdigit() else 0),
+                       r.get("title", "")),
+    )
+    return canonical_name, releases
+
+
+def render_album_table(albums: list[dict], artist: str) -> Table:
+    """Build a pretty table of albums for display."""
+    table = Table(
+        title=f"[bold cyan]{artist}[/] — {len(albums)} releases",
+        title_justify="left",
+        border_style="cyan",
+        header_style="bold",
+        padding=(0, 1),
+    )
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Year", justify="center")
+    table.add_column("Title", style="white")
+    table.add_column("Type", style="magenta")
+    for idx, alb in enumerate(albums, start=1):
+        table.add_row(
+            str(idx),
+            str(alb.get("year") or "?"),
+            alb.get("title", "?"),
+            alb.get("type", "Album"),
+        )
+    return table
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Download a YouTube Music album or full artist discography."
+    )
+    p.add_argument("artist")
+    p.add_argument("album", nargs="?", help="Album name (omit to download every album)")
+    p.add_argument(
+        "--browser",
+        default="firefox",
+        help="Browser to pull cookies from (firefox, chrome, brave, safari, edge)",
+    )
+    p.add_argument("--output-dir", default=".", help="Where to put the artist folder")
+    p.add_argument("-j", "--jobs", type=int, default=4, help="Parallel track downloads (default: 4)")
+    p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+    p.add_argument(
+        "--no-skip", action="store_true", help="Re-download tracks even if file already exists"
+    )
+    p.add_argument(
+        "--albums",
+        dest="include_albums",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include albums in discography mode (default: yes)",
+    )
+    p.add_argument(
+        "--singles",
+        dest="include_singles",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include singles/EPs in discography mode (default: no)",
+    )
+    args = p.parse_args()
+
+    yt = YTMusic()
+    output_dir = Path(args.output_dir)
+    skip_existing = not args.no_skip
+
+    if args.album:
+        match = find_album(yt, args.artist, args.album)
+        if not match:
+            console.print(f"[red]No album found for: {args.artist} {args.album}[/]")
+            return 1
+
+        artist_name = match["artists"][0]["name"]
+        album_title = match["title"]
+        year = match.get("year")
+        console.print(
+            f"\n[bold]Match:[/] [cyan]{artist_name}[/] — [white]{album_title}[/] "
+            f"[dim]({year or '?'})[/]\n"
+        )
+
+        if not args.yes:
+            ans = console.input("[bold]Download this?[/] \\[Y/n] ").strip().lower()
+            if ans and ans not in ("y", "yes"):
+                return 1
+
+        ok = download_album(
+            yt,
+            browse_id=match["browseId"],
+            album_artist_override=artist_name,
+            output_dir=output_dir,
+            browser=args.browser,
+            jobs=args.jobs,
+            skip_existing=skip_existing,
+        )
+        return 0 if ok else 1
+
+    # Full-discography mode
+    if not args.include_albums and not args.include_singles:
+        console.print("[red]Nothing to download:[/] both --no-albums and --no-singles set")
+        return 1
+
+    artist_name, albums = find_artist_discography(
+        yt,
+        args.artist,
+        include_albums=args.include_albums,
+        include_singles=args.include_singles,
+    )
+    if not albums:
+        kinds = " + ".join(
+            k for k, v in [("albums", args.include_albums), ("singles", args.include_singles)] if v
+        )
+        console.print(f"[red]No {kinds} found for artist:[/] {args.artist}")
+        return 1
+
+    console.print()
+    console.print(render_album_table(albums, artist_name))
+    console.print()
+
+    if not args.yes:
+        ans = console.input(
+            f"[bold]Download all {len(albums)} releases?[/] \\[y/N] "
+        ).strip().lower()
+        if ans not in ("y", "yes"):
+            return 1
+
+    overall_progress = Progress(
+        TextColumn("[bold blue]Discography"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        console=console,
+    )
+    overall_task = overall_progress.add_task("albums", total=len(albums))
+
+    overall_start = time.monotonic()
+    successes = 0
+
+    console.print()
+    with overall_progress:
+        for idx, alb in enumerate(albums, start=1):
+            try:
+                ok = download_album(
+                    yt,
+                    browse_id=alb["browseId"],
+                    album_artist_override=artist_name,
+                    output_dir=output_dir,
+                    browser=args.browser,
+                    jobs=args.jobs,
+                    skip_existing=skip_existing,
+                )
+                if ok:
+                    successes += 1
+            except Exception as e:
+                console.print(f"  [red]ERROR on '{alb.get('title')}': {e}[/]")
+            overall_progress.update(overall_task, advance=1)
+
+    elapsed = time.monotonic() - overall_start
+    color = "green" if successes == len(albums) else "yellow"
+    console.print(
+        f"\n[bold {color}]Done:[/] {successes}/{len(albums)} albums "
+        f"in [bold]{elapsed/60:.1f} min[/]"
+    )
+    return 0 if successes == len(albums) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
