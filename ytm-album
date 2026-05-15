@@ -554,6 +554,7 @@ def find_artist_discography(
                 return True
         return False
 
+    filtered: list[dict] = []
     for r in releases:
         # Always hydrate so we have artists + type for filtering.
         try:
