@@ -540,10 +540,13 @@ def find_artist_discography(
         if r.get("type", "Album") in allowed_types
     ]
 
-    # Sort: newest first, then alphabetically as tiebreaker
+    # Sort: oldest first, then alphabetically as tiebreaker.
+    # Releases with no year sort last (treated as year 9999).
     releases.sort(
-        key=lambda r: (-(int(r["year"]) if str(r.get("year", "")).isdigit() else 0),
-                       r.get("title", "")),
+        key=lambda r: (
+            int(r["year"]) if str(r.get("year", "")).isdigit() else 9999,
+            r.get("title", ""),
+        ),
     )
     return canonical_name, releases
 
