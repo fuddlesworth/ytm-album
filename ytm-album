@@ -632,6 +632,34 @@ def find_artist_discography(
         if r.get("type", "Album") in allowed_types
     ]
 
+    # Deduplicate by (normalized title, year) — YouTube Music often lists the
+    # same album twice (e.g. clean + explicit, or regional re-releases).
+    # Prefer the explicit version when present (more complete tracks),
+    # falling back to whichever has more tracks, then to the first seen.
+    def dedup_key(r: dict) -> tuple[str, str]:
+        title = _normalize(r.get("title", ""))
+        # Strip common edition suffixes so "Album" and "Album (Deluxe)" merge
+        for suffix in ("explicit", "clean", "deluxe", "deluxeedition",
+                       "specialedition", "remastered", "expanded"):
+            if title.endswith(suffix):
+                title = title[: -len(suffix)]
+        return (title, str(r.get("year") or ""))
+
+    def is_explicit(r: dict) -> bool:
+        return "explicit" in (r.get("title") or "").lower()
+
+    grouped: dict[tuple[str, str], dict] = {}
+    for r in releases:
+        key = dedup_key(r)
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = r
+            continue
+        # Prefer explicit; otherwise keep whichever has more tracks (if known).
+        if is_explicit(r) and not is_explicit(existing):
+            grouped[key] = r
+    releases = list(grouped.values())
+
     # Sort: newest first, then alphabetically as tiebreaker
     releases.sort(
         key=lambda r: (-(int(r["year"]) if str(r.get("year", "")).isdigit() else 0),
