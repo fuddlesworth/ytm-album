@@ -457,9 +457,60 @@ def _scrape_albums_via_browse(
     return found
 
 
+def _pick_artist(yt: YTMusic, query: str, auto_yes: bool) -> dict | None:
+    """Search for artists matching `query` and disambiguate when collisions exist.
+
+    Returns the chosen artist dict (with browseId, artist, etc.) or None.
+    With auto_yes=True, picks the top result without prompting.
+    """
+    results = yt.search(query, filter="artists", limit=5)
+    if not results:
+        return None
+    if len(results) == 1 or auto_yes:
+        return results[0]
+
+    target = _normalize(query)
+    exact = [r for r in results if _normalize(r.get("artist", "")) == target]
+    # If only one result has the exact name (normalized), no ambiguity.
+    if len(exact) == 1:
+        return exact[0]
+
+    # Show a disambiguation table.
+    table = Table(
+        title=f"[bold]Multiple artists match '{query}':[/]",
+        title_justify="left",
+        border_style="yellow",
+        header_style="bold",
+        padding=(0, 1),
+    )
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Artist", style="white")
+    table.add_column("Subscribers", justify="right", style="dim")
+    table.add_column("Channel ID", style="dim")
+    for i, r in enumerate(results, start=1):
+        table.add_row(
+            str(i),
+            r.get("artist", "?"),
+            r.get("subscribers", "—") or "—",
+            r.get("browseId", "?"),
+        )
+    console.print()
+    console.print(table)
+
+    while True:
+        ans = console.input(
+            f"[bold]Pick an artist[/] \\[1-{len(results)}, default 1] "
+        ).strip()
+        if not ans:
+            return results[0]
+        if ans.isdigit() and 1 <= int(ans) <= len(results):
+            return results[int(ans) - 1]
+        console.print(f"[red]Invalid choice. Enter 1-{len(results)}.[/]")
+
+
 def find_artist_discography(
     yt: YTMusic, artist: str, *, include_albums: bool, include_singles: bool,
-    browser: str = "firefox"
+    browser: str = "firefox", auto_yes: bool = False
 ) -> tuple[str, list[dict]]:
     """Return (canonical_artist_name, [release_dict, ...]) for an artist.
 
@@ -467,11 +518,11 @@ def find_artist_discography(
     truncated, supplements with search results filtered to the artist.
     Sections are selected via include_albums / include_singles.
     """
-    results = yt.search(artist, filter="artists", limit=1)
-    if not results:
+    chosen = _pick_artist(yt, artist, auto_yes)
+    if not chosen:
         return artist, []
-    channel_id = results[0]["browseId"]
-    canonical_name = results[0]["artist"]
+    channel_id = chosen["browseId"]
+    canonical_name = chosen["artist"]
 
     sections: list[str] = []
     if include_albums:
@@ -690,6 +741,7 @@ def main() -> int:
         include_albums=args.include_albums,
         include_singles=args.include_singles,
         browser=args.browser,
+        auto_yes=args.yes,
     )
     if not albums:
         kinds = " + ".join(
