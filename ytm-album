@@ -121,6 +121,25 @@ def _find_track_videoid(
     return None
 
 
+def _enrich_track_metadata(
+    yt: YTMusic, video_id: str, fallback_album: str, fallback_artist: str
+) -> tuple[str | None, str | None]:
+    """Look up canonical track title + artists via the watch playlist.
+
+    Returns (title, artist_string) — either may be None if lookup fails.
+    Used when get_album() returns a track with sparse/missing metadata.
+    """
+    try:
+        wp = yt.get_watch_playlist(videoId=video_id, limit=1)
+        track = (wp.get("tracks") or [{}])[0]
+        title = track.get("title")
+        artists = track.get("artists") or []
+        artist_str = ", ".join(a.get("name", "") for a in artists if a.get("name"))
+        return (title, artist_str or fallback_artist)
+    except Exception:
+        return (None, None)
+
+
 def process_track(
     *,
     index: int,
@@ -136,9 +155,29 @@ def process_track(
     yt: YTMusic,
 ) -> tuple[str, str, float]:
     """Download + tag one track. Returns (status, message, elapsed_seconds)."""
-    track_title = track["title"]
-    track_artists = ", ".join(a["name"] for a in track.get("artists", [])) or album_artist
+    track_title = track.get("title") or ""
+    track_artists_list = track.get("artists") or []
+    track_artists = ", ".join(a.get("name", "") for a in track_artists_list if a.get("name"))
     video_id = track.get("videoId")
+
+    # Detect sparse metadata: missing title, missing artists, or generic
+    # placeholder values like "Unknown" / "Track N".
+    title_missing = not track_title or track_title.lower() in ("unknown", "")
+    artist_missing = not track_artists or track_artists.lower() in ("unknown", "unknown artist")
+
+    if video_id and (title_missing or artist_missing):
+        enriched_title, enriched_artist = _enrich_track_metadata(
+            yt, video_id, album_title, album_artist
+        )
+        if enriched_title and title_missing:
+            track_title = enriched_title
+        if enriched_artist and artist_missing:
+            track_artists = enriched_artist
+
+    if not track_artists:
+        track_artists = album_artist
+    if not track_title:
+        track_title = f"Track {index:02d}"
 
     if not video_id:
         video_id = _find_track_videoid(yt, track_title, track_artists, album_title)
