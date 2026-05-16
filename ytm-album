@@ -633,40 +633,62 @@ def find_artist_discography(
         if r.get("type", "Album") in allowed_types
     ]
 
-    # Disambiguate releases that share a normalized title — YouTube Music
-    # sometimes lists the same album as both a clean and explicit version
-    # under identical titles. Annotate each with `display_title` and
-    # `folder_suffix` so colliding releases get distinct folder names.
+    # When the same album has both a clean and an explicit version,
+    # YouTube Music lists them as two separate browseIds with identical
+    # titles and years. Treat those as duplicates and keep only the
+    # explicit one (more complete audio).
     def base_title(r: dict) -> str:
-        return _normalize(r.get("title", ""))
+        t = _normalize(r.get("title", ""))
+        for suffix in ("explicit", "clean"):
+            if t.endswith(suffix):
+                t = t[: -len(suffix)]
+        return t
 
-    title_groups: dict[str, list[dict]] = {}
+    def is_explicit(r: dict) -> bool:
+        return (
+            r.get("isExplicit") is True
+            or "explicit" in (r.get("title") or "").lower()
+        )
+
+    # Group by (base_title, year). Within each group, if releases differ only
+    # by explicit-vs-clean, keep just the explicit. Otherwise keep all and
+    # add a folder_suffix to disambiguate (deluxe, remaster, regional, etc.).
+    groups: dict[tuple[str, str], list[dict]] = {}
     for r in releases:
-        title_groups.setdefault(base_title(r), []).append(r)
+        groups.setdefault((base_title(r), str(r.get("year") or "")), []).append(r)
 
-    for group in title_groups.values():
-        if len(group) <= 1:
-            for r in group:
-                r["folder_suffix"] = ""
+    deduped: list[dict] = []
+    for group in groups.values():
+        if len(group) == 1:
+            group[0]["folder_suffix"] = ""
+            deduped.append(group[0])
             continue
-        # Multiple releases share this title — pick a discriminator per release.
+        # Pure explicit/clean pair? Drop the clean one.
+        explicits = [r for r in group if is_explicit(r)]
+        cleans = [r for r in group if not is_explicit(r)]
+        if explicits and cleans and len(explicits) + len(cleans) == len(group):
+            # If every member is either clearly explicit or clearly clean
+            # AND the actual stored titles match (modulo "(Explicit)" suffix),
+            # treat as dupes and keep only the explicit version(s).
+            stored_titles = {(r.get("title") or "").lower()
+                             .replace("(explicit)", "").strip()
+                             for r in group}
+            if len(stored_titles) == 1:
+                for r in explicits:
+                    r["folder_suffix"] = ""
+                deduped.extend(explicits)
+                continue
+        # Genuine variants (deluxe/remaster/etc.) — keep all, add suffixes.
         for r in group:
-            tags: list[str] = []
-            if any("explicit" in (a.get("name", "") or "").lower()
-                   for a in r.get("artists", []) or []):
-                pass  # placeholder; explicit isn't on artists
-            meta_title = (r.get("title") or "").lower()
-            is_explicit = "explicit" in meta_title or r.get("isExplicit") is True
-            year = r.get("year")
             parts: list[str] = []
-            if is_explicit:
+            if is_explicit(r):
                 parts.append("Explicit")
-            if year:
-                parts.append(str(year))
-            # If still nothing distinct, fall back to the browseId tail
-            if not parts:
-                parts.append(r["browseId"][-6:])
+            # If multiple releases still collide on title, append browseId tail
+            # to guarantee uniqueness on disk.
+            parts.append(r["browseId"][-6:])
             r["folder_suffix"] = " (" + " - ".join(parts) + ")"
+            deduped.append(r)
+    releases = deduped
 
     # Sort: newest first, then alphabetically as tiebreaker
     releases.sort(
